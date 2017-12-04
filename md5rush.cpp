@@ -7,6 +7,8 @@
 #include <thread>
 #include <vector>
 
+#include "md5.h"
+
 /**
  * Increase the sequence [first, last) by step.
  * The sequence cannot expand beyond cap.
