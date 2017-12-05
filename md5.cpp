@@ -42,7 +42,7 @@ namespace md5 {
         1u << 31, 1 << 30, 1 << 29, 1 << 28, 1 << 27, 1 << 26, 1 << 25, 1 << 24,
     };
 
-    constexpr State update(State state, const uint32_t *m) {
+    State update(State state, const uint32_t *m) {
         auto [a, b, c, d] = state;
 #define MD5_STATE_UPDATE_LOOP(IBEGIN, IEND, FEXPR, GEXPR) \
         for (uint32_t i = (IBEGIN); i < (IEND); i++) { \
@@ -67,7 +67,7 @@ namespace md5 {
         return state;
     }
 
-    constexpr State md5(const uint32_t *d, size_t nbits) {
+    State md5(const uint32_t *d, size_t nbits) {
         State state;
         size_t rem = nbits;
         while (rem >= 512) {

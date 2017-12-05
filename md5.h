@@ -1,5 +1,5 @@
 #include <cstdint>
-#include <iostream>
+#include <ostream>
 
 namespace md5 {
     struct State {
@@ -10,10 +10,10 @@ namespace md5 {
             State(0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476) {}
     };
 
-    constexpr State update(State state, const uint32_t *m)
+    State update(State state, const uint32_t *m)
         __attribute__((warn_unused_result));
 
-    constexpr State md5(const uint32_t *d, size_t nbits);
+    State md5(const uint32_t *d, size_t nbits);
 
     std::ostream &operator << (std::ostream &out, State state);
 }

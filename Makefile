@@ -2,7 +2,7 @@
 
 LINK.o = $(LINK.cc)
 CXXFLAGS += -O3 -Wall -Wextra -Wshadow -std=c++17
-LDFLAGS += -lcrypto -lpthread
+LDFLAGS += -lpthread
 
 all: md5rush md5sum
 
