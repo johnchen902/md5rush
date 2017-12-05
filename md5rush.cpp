@@ -195,7 +195,6 @@ void print_treasure(std::ostream &out, Iterator begin, Iterator end) {
     out << std::right << std::hex << std::setfill('0');
     while (begin != end)
         out << std::setw(8) << __builtin_bswap32(*begin++);
-    out << std::endl;
     out.flags(flags);
 }
 
@@ -310,11 +309,12 @@ int main(int argc, char **argv) {
 lb_found:
     std::cout << "Treasure Found!" << std::endl;
 
-    std::cout << "Treasure:" << std::endl;
+    std::cout << "Treasure: ";
     print_treasure(std::cout, prefix.begin(), prefix.end());
+    std::cout << std::endl;
 
-    std::cout << "Hash:" << std::endl;
-    std::cout << md5::md5(prefix.data(), prefix.size() * 32) << std::endl;
+    std::cout << "Hash: "
+        << md5::md5(prefix.data(), prefix.size() * 32) << std::endl;
 
     if (outfile.has_value()) {
         std::cout << "Saving treasure to " << outfile.value() << std::endl;
