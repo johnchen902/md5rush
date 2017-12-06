@@ -1,7 +1,7 @@
 #!/usr/bin/fish
 for i in (seq 1 32)
     echo "Seaching for $i-treasure..."
-    time ./md5rush -z $i -p treasure-(math $i - 1) -o treasure-$i
+    ./md5rush -z $i -p treasure-(math $i - 1) -o treasure-$i
     or exit $status
     echo
 end

@@ -1,9 +1,10 @@
 #include <algorithm>
-#include <atomic>
+#include <boost/scope_exit.hpp>
 #include <boost/thread/sync_queue.hpp> // Put earlier to fix boost 1.65.1-2
 #include <boost/thread/concurrent_queues/queue_adaptor.hpp>
 #include <boost/thread/concurrent_queues/queue_views.hpp>
 #include <cassert>
+#include <chrono>
 #include <iterator>
 #include <iomanip>
 #include <iostream>
@@ -356,11 +357,19 @@ int main(int argc, char **argv) {
     boost::queue_adaptor<boost::sync_queue<Result>> result_queue;
     std::vector<std::thread> threads;
 
+    BOOST_SCOPE_EXIT(&threads) {
+        for (std::thread &t : threads)
+            if (t.joinable())
+                t.join();
+    } BOOST_SCOPE_EXIT_END;
+
     std::cout << "Using " << nthreads << " threads." << std::endl;
     for (unsigned i = 0; i < nthreads; i++)
         threads.emplace_back(next_treasure_worker<MD5_zeroes>,
             boost::queue_front<Work<MD5_zeroes>>(work_queue),
             boost::queue_back<Result>(result_queue));
+
+    auto time_start = std::chrono::high_resolution_clock::now();
 
     size_t count = next_treasure_main(prefix,
             boost::queue_back<Work<MD5_zeroes>>(work_queue),
@@ -370,9 +379,9 @@ int main(int argc, char **argv) {
                 return MD5_zeroes(state, zeroes.value());
             });
 
+    auto time_end = std::chrono::high_resolution_clock::now();
+
     work_queue.close();
-    for (std::thread &t : threads)
-        t.join();
 
     std::cout << "Treasure Found!" << std::endl;
 
@@ -383,7 +392,10 @@ int main(int argc, char **argv) {
     std::cout << "Hash: "
         << md5::md5(prefix.data(), prefix.size() * 32) << std::endl;
 
-    std::cout << "Hash computed: " << count << std::endl;
+    double time = std::chrono::nanoseconds(time_end - time_start).count() * 1e-9;
+    std::cout << "Time used: " << time << " seconds" << std::endl;
+    std::cout << "Hashes computed: " << count << std::endl;
+    std::cout << "Hashes per second: " << count / time << std::endl;
 
     if (outfile.has_value()) {
         bool ret = write_result(prefix, outfile.value());
