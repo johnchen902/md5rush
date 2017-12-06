@@ -1,5 +1,8 @@
 #include <algorithm>
 #include <atomic>
+#include <boost/thread/sync_queue.hpp> // Put earlier to fix boost 1.65.1-2
+#include <boost/thread/concurrent_queues/queue_adaptor.hpp>
+#include <boost/thread/concurrent_queues/queue_views.hpp>
 #include <cassert>
 #include <iterator>
 #include <iomanip>
@@ -14,108 +17,178 @@
 
 #include "md5.h"
 
+namespace {
+
+template<typename Predicate>
+struct Work {
+    size_t max_count;
+    unsigned mutable_begin, mutable_end;
+    std::array<uint32_t, 16> array;
+    Predicate pred;
+    Work() = default;
+};
+
+struct Result {
+    size_t count;
+    std::optional<std::array<uint32_t, 16>> array;
+    Result() = default;
+    Result(size_t _count): count(_count), array() {}
+    Result(size_t _count, std::array<uint32_t, 16> _array):
+        count(_count), array(_array) {}
+};
+
 /**
  * Increase the sequence [first, last) by addend.
  *
  * Returns carry (when the sequence is full).
  */
 template<typename Iterator>
-auto next_sequence(Iterator first, Iterator last,
+auto add_sequence(Iterator first, Iterator last,
         typename std::iterator_traits<Iterator>::value_type addend) {
     for (; addend && first != last; ++first)
         addend = __builtin_add_overflow(*first, addend, std::addressof(*first));
     return addend;
 }
 
-/**
- * Find 'next' treasure satisfying pred(begin, end).
- * 'Next' means next_sequence(mutable_begin, mutable_end, step_size).
- *
- * Returns true if one is found, false otherwise.
- */
-template<typename Iterator, typename Predicate>
-bool next_treasure(Iterator begin, Iterator end,
-        Iterator mutable_begin, Iterator mutable_end,
-        typename std::iterator_traits<Iterator>::value_type step_size,
-        Predicate pred) {
-    do {
-        if (pred(begin, end))
-            return true;
-    } while (!next_sequence(mutable_begin, mutable_end, step_size));
-    return false;
+template<typename Container>
+bool next_work_array(Container &array, size_t begin, size_t end,
+        typename Container::value_type n = 1) {
+    return add_sequence(std::begin(array) + begin,
+            std::begin(array) + end, n) == 0;
 }
 
 template<typename Predicate>
-class Stop_predicate {
-    Predicate pred;
-    std::atomic<bool> &stop;
-public:
-    Stop_predicate(Predicate _pred, std::atomic<bool> &_stop):
-            pred(_pred), stop(_stop) {}
-    template<typename ...Params>
-    bool operator () (Params &&...args) const {
-        return stop.load(std::memory_order_relaxed) ||
-            pred(std::forward<Params>(args)...);
-    }
-};
-
-template<typename Iterator, typename Predicate>
-void next_treasure_for_thread(Iterator begin, Iterator end,
-        Iterator mutable_begin, Iterator mutable_end,
-        typename std::iterator_traits<Iterator>::value_type step_size,
-        Predicate pred, std::atomic<bool> &stop, bool &return_value) {
-    return_value = next_treasure(begin, end, mutable_begin, mutable_end,
-            step_size, Stop_predicate(pred, stop));
-    if (stop.load(std::memory_order_relaxed))
-        return_value = false;
-    if (return_value)
-        stop.store(true, std::memory_order_relaxed);
+std::pair<Work<Predicate>, Work<Predicate>> split_work(
+        Work<Predicate> work, size_t split_count) {
+    Work work1 = work;
+    work1.max_count = std::min(work1.max_count, split_count);
+    work.max_count -= work1.max_count;
+    if (!next_work_array(work.array, work.mutable_begin, work.mutable_end,
+            split_count))
+        work.max_count = 0;
+    return std::make_pair(work1, work);
 }
 
-template<typename Iterator, typename Predicate>
-bool next_treasure_multithread(Iterator begin, Iterator end,
-        Iterator mutable_begin, Iterator mutable_end,
-        typename std::iterator_traits<Iterator>::value_type step_size,
-        Predicate pred, unsigned nthreads) {
-    using T = typename std::iterator_traits<Iterator>::value_type;
-    std::vector<std::vector<T>> buffers;
-    std::vector<std::array<bool, 1>> results;
-    std::vector<std::thread> threads;
-
-    buffers.reserve(nthreads);
-    threads.reserve(nthreads);
-    results.reserve(nthreads);
-    std::atomic<bool> stop = false;
-
-    for (size_t i = 0; i < nthreads; i++) {
-        buffers.emplace_back(begin, end);
-        results.emplace_back();
-
-        auto tbegin = buffers[i].data();
-        auto tend = tbegin + (end - begin);
-        auto tmutable_begin = tbegin + (mutable_begin - begin);
-        auto tmutable_end = tbegin + (mutable_end - begin);
-        threads.emplace_back(next_treasure_for_thread<Iterator, Predicate>,
-            tbegin, tend, tmutable_begin, tmutable_end,
-            step_size * nthreads, // TODO overflow check
-            pred, std::ref(stop), std::ref(results[i][0]));
-
-        if (next_sequence(mutable_begin, mutable_end, step_size))
+/**
+ * Find 'next' treasure satisfying pred(work.array).
+ */
+template<typename Predicate>
+Result next_treasure(Work<Predicate> work) {
+    auto [max_count, mutable_begin, mutable_end, array, pred] = work;
+    size_t count = 0;
+    while (count < max_count) {
+        count++;
+        if (pred(array))
+            return Result(count, array);
+        if (!next_work_array(array, mutable_begin, mutable_end))
             break;
     }
+    return Result(count);
+}
 
-    for (std::thread &t : threads)
-        t.join();
+template<typename Predicate>
+void next_treasure_worker(
+        boost::queue_front<Work<Predicate>> work_queue,
+        boost::queue_back<Result> result_queue) {
+    while (true) {
+        Work<Predicate> work;
+        auto status = work_queue.wait_pull(work);
+        if (status != boost::queue_op_status::success)
+            break;
+        result_queue.push(next_treasure(work));
+    }
+}
 
-    for (size_t i = 0; i < threads.size(); i++) {
-        if (results[i][0]) {
-            auto tbegin = buffers[i].data();
-            auto tend = tbegin + (end - begin);
-            std::copy(tbegin, tend, begin);
-            return true;
+template<typename Predicate>
+Result next_treasure_master(Work<Predicate> work,
+        boost::queue_back<Work<Predicate>> work_queue,
+        boost::queue_front<Result> result_queue,
+        size_t max_running_works, size_t block_size) {
+    assert(max_running_works);
+
+    bool exhausted = false;
+    size_t running_works = 0;
+    size_t count = 0;
+    while (!exhausted || running_works) {
+        if (!exhausted && running_works < max_running_works) {
+            if (work.max_count == 0) {
+                exhausted = true;
+            } else {
+                auto [work1, work2] = split_work(work, block_size);
+                work_queue.push(work1);
+                running_works++;
+                work = work2;
+            }
+        } else {
+            assert(running_works);
+
+            Result result;
+            result_queue.pull(result);
+            running_works--;
+
+            count += result.count;
+
+            if (result.array.has_value())
+                return Result(count, result.array.value());
         }
     }
-    return false;
+    return Result(count);
+}
+
+void prepare_last_block(std::array<uint32_t, 16> &arr,
+        uint32_t mutable_begin, uint32_t mutable_end, size_t nbits) {
+    assert(mutable_begin <= mutable_end);
+    assert(mutable_end + 3 <= 16);
+
+    std::fill(arr.begin() + mutable_begin, arr.begin() + mutable_end, 0);
+    arr[mutable_end] = 0x00000080;
+    std::fill(arr.begin() + mutable_end + 1, arr.end() - 2, 0);
+    arr[16 - 2] = nbits;
+    arr[16 - 1] = nbits >> 32;
+}
+
+template<typename Pred_gen>
+using Predicate_t = std::invoke_result_t<Pred_gen, md5::State>;
+template<typename Pred_gen>
+size_t next_treasure_main(std::vector<uint32_t> &prefix,
+        boost::queue_back<Work<Predicate_t<Pred_gen>>> work_queue,
+        boost::queue_front<Result> result_queue,
+        size_t max_running_works, size_t block_size,
+        Pred_gen pred_gen) {
+    md5::State state;
+    for (size_t i = 0; i + 16 <= prefix.size(); i += 16)
+        state = update(state, prefix.data() + i);
+
+    size_t count = 0;
+    while (true) {
+        if (prefix.size() % 16 + 4 <= 16) {
+            std::array<uint32_t, 16> buf = {};
+            uint32_t psize = prefix.size() % 16;
+
+            std::copy(prefix.end() - psize, prefix.end(), buf.begin());
+            for (uint32_t i = 1; psize + i + 3 <= 16; i++) {
+                prepare_last_block(buf, psize, psize + i,
+                         (prefix.size() + i) * 32);
+                Work<Predicate_t<Pred_gen>> work {
+                    std::numeric_limits<size_t>::max(),
+                    psize, psize + i, buf, pred_gen(state) };
+
+                Result result = next_treasure_master(work,
+                        work_queue, result_queue,
+                        max_running_works, block_size);
+                count += result.count;
+                if (result.array.has_value()) {
+                    const auto &array = result.array.value();
+                    prefix.insert(prefix.end(), array.begin() + psize,
+                            array.begin() + psize + i);
+                    return count;
+                }
+            }
+        }
+        prefix.resize(prefix.size() / 16 * 16 + 16);
+
+        state = update(state, prefix.data() + prefix.size() - 16);
+    }
 }
 
 class MD5_zeroes {
@@ -132,12 +205,11 @@ class MD5_zeroes {
     md5::State init_state;
     uint32_t zeroes;
 public:
+    MD5_zeroes() = default;
     MD5_zeroes(md5::State _init_state, uint32_t _zeroes) :
         init_state(_init_state), zeroes(_zeroes) {}
-    bool operator () (const uint32_t *begin, const uint32_t *end) const {
-        assert(end - begin == 16);
-
-        md5::State state = md5::update(init_state, begin);
+    bool operator () (std::array<uint32_t, 16> array) const {
+        md5::State state = md5::update(init_state, array.data());
 
         if (zeroes < 8) {
             return (state.a & zero_masks[zeroes]) == 0;
@@ -160,20 +232,6 @@ public:
         }
     }
 };
-
-void prepare_last_block(uint32_t *begin, uint32_t *mutable_begin,
-        uint32_t *mutable_end, size_t nbits) {
-    uint32_t *end = begin + 16;
-    assert(begin <= mutable_begin);
-    assert(mutable_begin <= mutable_end);
-    assert(mutable_end + 3 <= end);
-
-    std::fill(mutable_begin, mutable_end, 0);
-    *mutable_end = 0x00000080;
-    std::fill(mutable_end + 1, end - 2, 0);
-    end[-2] = nbits;
-    end[-1] = nbits >> 32;
-}
 
 std::vector<uint32_t> string_to_uint32(const std::string &str) {
     std::vector<uint32_t> v((str.size() + 3) / 4);
@@ -208,12 +266,31 @@ void usage(const char *progname, std::ostream &out) {
     out.flush();
 }
 
+bool read_prefix(std::vector<uint32_t> &prefix, const char *path) {
+    std::ifstream fin(path, std::ifstream::binary);
+    if (!fin)
+        return false;
+    std::stringstream sstr;
+    sstr << fin.rdbuf();
+    prefix = string_to_uint32(sstr.str());
+    return true;
+}
+
+bool write_result(const std::vector<uint32_t> &result, const char *path) {
+    std::ofstream fout(path, std::ofstream::binary);
+    if (!fout)
+        return false;
+    fout << uint32_to_string(result);
+    return true;
+}
+
+}
 
 int main(int argc, char **argv) {
-    std::optional<uint32_t> zeroes;
+    std::optional<unsigned> zeroes;
     std::optional<const char *> prefixfile;
     std::optional<const char *> outfile;
-    uint32_t nthreads = 0;
+    unsigned nthreads = 0;
 
     for (int opt; (opt = getopt(argc, argv, "hz:t:p:o:")) != -1; ) {
         switch (opt) {
@@ -254,6 +331,7 @@ int main(int argc, char **argv) {
         std::cerr << argv[0] << ": missing required argument '-z'" << std::endl;
         return 1;
     }
+
     if (nthreads == 0) {
         nthreads = std::thread::hardware_concurrency();
         if (nthreads == 0) {
@@ -266,47 +344,36 @@ int main(int argc, char **argv) {
 
     std::vector<uint32_t> prefix;
     if (prefixfile.has_value()) {
-        std::ifstream fin(prefixfile.value(), std::ifstream::binary);
-        if (!fin) {
-            std::cerr << argv[0] << ": cannot open '" << prefixfile.value()
-                    << "'" << std::endl;
+        bool ret = read_prefix(prefix, prefixfile.value());
+        if (!ret) {
+            std::cerr << argv[0] << ": cannot read prefix from '"
+                << prefixfile.value() << "'" << std::endl;
             return 1;
         }
-        std::stringstream sstr;
-        sstr << fin.rdbuf();
-        prefix = string_to_uint32(sstr.str());
     }
 
-    md5::State state;
-    for (size_t i = 0; i + 16 <= prefix.size(); i += 16)
-        state = update(state, prefix.data() + i);
+    boost::queue_adaptor<boost::sync_queue<Work<MD5_zeroes>>> work_queue;
+    boost::queue_adaptor<boost::sync_queue<Result>> result_queue;
+    std::vector<std::thread> threads;
 
     std::cout << "Using " << nthreads << " threads." << std::endl;
+    for (unsigned i = 0; i < nthreads; i++)
+        threads.emplace_back(next_treasure_worker<MD5_zeroes>,
+            boost::queue_front<Work<MD5_zeroes>>(work_queue),
+            boost::queue_back<Result>(result_queue));
 
-    while (true) {
-        if (prefix.size() % 16 + 4 <= 16) {
-            uint32_t buf[16] = {};
-            uint32_t psize = prefix.size() % 16;
+    size_t count = next_treasure_main(prefix,
+            boost::queue_back<Work<MD5_zeroes>>(work_queue),
+            boost::queue_front<Result>(result_queue),
+            2 * nthreads, 10000u,
+            [zeroes](md5::State state) {
+                return MD5_zeroes(state, zeroes.value());
+            });
 
-            std::copy(prefix.end() - psize, prefix.end(), buf);
-            for (uint32_t i = 1; psize + i + 3 <= 16; i++) {
-                prepare_last_block(buf, buf + psize, buf + psize + i,
-                        (prefix.size() + i) * 32);
-                bool found = next_treasure_multithread(buf, buf + 16,
-                        buf + psize, buf + psize + i, 1,
-                        MD5_zeroes(state, zeroes.value()), nthreads);
-                if (found) {
-                    prefix.insert(prefix.end(), buf + psize, buf + psize + i);
-                    goto lb_found;
-                }
-            }
-        }
-        prefix.resize(prefix.size() / 16 * 16 + 16);
+    work_queue.close();
+    for (std::thread &t : threads)
+        t.join();
 
-        state = update(state, prefix.data() + prefix.size() - 16);
-    }
-
-lb_found:
     std::cout << "Treasure Found!" << std::endl;
 
     std::cout << "Treasure: ";
@@ -316,15 +383,15 @@ lb_found:
     std::cout << "Hash: "
         << md5::md5(prefix.data(), prefix.size() * 32) << std::endl;
 
-    if (outfile.has_value()) {
-        std::cout << "Saving treasure to " << outfile.value() << std::endl;
+    std::cout << "Hash computed: " << count << std::endl;
 
-        std::ofstream fout(outfile.value(), std::ofstream::binary);
-        if (!fout) {
-            std::cerr << argv[0] << ": cannot open '" << outfile.value()
-                    << "'" << std::endl;
+    if (outfile.has_value()) {
+        bool ret = write_result(prefix, outfile.value());
+        if (!ret) {
+            std::cerr << argv[0] << ": cannot write result to '"
+                << outfile.value() << "'" << std::endl;
             return 1;
         }
-        fout << uint32_to_string(prefix);
+        std::cout << "Treasure saved to " << outfile.value() << std::endl;
     }
 }
