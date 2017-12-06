@@ -259,11 +259,15 @@ void print_treasure(std::ostream &out, Iterator begin, Iterator end) {
 
 void usage(const char *progname, std::ostream &out) {
     using std::endl;
-    out << "Usage: " << progname << " [OPTION]... -z ZEROES PREFIXFILE\n"
+    out << "Usage: " << progname << " [OPTION]...\n"
         << "\n"
-        << "  -z ZEROES      number of zeroes to look for\n"
+        << "  -z ZEROES      number of zeroes to look for (mandantory)\n"
         << "  -t THREADS     number of threads to use\n"
-        << "                 (0: use std::thread::hardware_concurrency())\n";
+        << "                 (0: use std::thread::hardware_concurrency())\n"
+        << "  -p PREFIXFILE  read prefix from PREFIXFILE\n"
+        << "  -o OUTPUTFILE  write result to OUTPUTFILE\n"
+        << "  -b BLOCKSIZE   tunable parameter: number of hashes per work\n"
+        << "                 default: 10000\n";
     out.flush();
 }
 
@@ -292,8 +296,9 @@ int main(int argc, char **argv) {
     std::optional<const char *> prefixfile;
     std::optional<const char *> outfile;
     unsigned nthreads = 0;
+    unsigned block_size = 10000;
 
-    for (int opt; (opt = getopt(argc, argv, "hz:t:p:o:")) != -1; ) {
+    for (int opt; (opt = getopt(argc, argv, "hz:t:p:o:b:")) != -1; ) {
         switch (opt) {
         case 'h':
             usage(argv[0], std::cout);
@@ -316,6 +321,15 @@ int main(int argc, char **argv) {
             break;
         case 'o':
             outfile = optarg;
+            break;
+        case 'b':
+            block_size = strtoul(optarg, nullptr, 0);
+            if (block_size == 0) {
+                std::cerr << argv[0] << ": invalid argument '"
+                    << optarg << "' for '-b'" << std::endl;
+                std::cerr << "Block size must be positive." << std::endl;
+                return 1;
+            }
             break;
         default:
             return 1;
@@ -374,7 +388,7 @@ int main(int argc, char **argv) {
     size_t count = next_treasure_main(prefix,
             boost::queue_back<Work<MD5_zeroes>>(work_queue),
             boost::queue_front<Result>(result_queue),
-            2 * nthreads, 10000u,
+            2 * nthreads, block_size,
             [zeroes](md5::State state) {
                 return MD5_zeroes(state, zeroes.value());
             });
