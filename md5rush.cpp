@@ -24,6 +24,7 @@ template<typename Predicate>
 struct Work {
     size_t max_count;
     unsigned mutable_begin, mutable_end;
+    md5::State init_state;
     std::array<uint32_t, 16> array;
     Predicate pred;
     Work() = default;
@@ -75,13 +76,12 @@ std::pair<Work<Predicate>, Work<Predicate>> split_work(
  */
 template<typename Predicate>
 Result next_treasure(Work<Predicate> work) {
-    auto [max_count, mutable_begin, mutable_end, array, pred] = work;
     size_t count = 0;
-    while (count < max_count) {
+    while (count < work.max_count) {
         count++;
-        if (pred(array))
-            return Result(count, array);
-        if (!next_work_array(array, mutable_begin, mutable_end))
+        if (work.pred(md5::update(work.init_state, work.array.data())))
+            return Result(count, work.array);
+        if (!next_work_array(work.array, work.mutable_begin, work.mutable_end))
             break;
     }
     return Result(count);
@@ -148,14 +148,12 @@ void prepare_last_block(std::array<uint32_t, 16> &arr,
     arr[16 - 1] = nbits >> 32;
 }
 
-template<typename Pred_gen>
-using Predicate_t = std::invoke_result_t<Pred_gen, md5::State>;
-template<typename Pred_gen>
+template<typename Predicate>
 size_t next_treasure_main(std::vector<uint32_t> &prefix,
-        boost::queue_back<Work<Predicate_t<Pred_gen>>> work_queue,
+        boost::queue_back<Work<Predicate>> work_queue,
         boost::queue_front<Result> result_queue,
         size_t max_running_works, size_t block_size,
-        Pred_gen pred_gen) {
+        Predicate predicate) {
     md5::State state;
     for (size_t i = 0; i + 16 <= prefix.size(); i += 16)
         state = update(state, prefix.data() + i);
@@ -170,9 +168,9 @@ size_t next_treasure_main(std::vector<uint32_t> &prefix,
             for (uint32_t i = 1; psize + i + 3 <= 16; i++) {
                 prepare_last_block(buf, psize, psize + i,
                          (prefix.size() + i) * 32);
-                Work<Predicate_t<Pred_gen>> work {
+                Work<Predicate> work {
                     std::numeric_limits<size_t>::max(),
-                    psize, psize + i, buf, pred_gen(state) };
+                    psize, psize + i, state, buf, predicate };
 
                 Result result = next_treasure_master(work,
                         work_queue, result_queue,
@@ -203,15 +201,11 @@ class MD5_zeroes {
         0x00ffffff,
         0xf0ffffff,
     };
-    md5::State init_state;
     uint32_t zeroes;
 public:
     MD5_zeroes() = default;
-    MD5_zeroes(md5::State _init_state, uint32_t _zeroes) :
-        init_state(_init_state), zeroes(_zeroes) {}
-    bool operator () (std::array<uint32_t, 16> array) const {
-        md5::State state = md5::update(init_state, array.data());
-
+    MD5_zeroes(uint32_t _zeroes): zeroes(_zeroes) {}
+    bool operator () (md5::State state) const {
         if (zeroes < 8) {
             return (state.a & zero_masks[zeroes]) == 0;
         } else if (zeroes < 16) {
@@ -389,9 +383,7 @@ int main(int argc, char **argv) {
             boost::queue_back<Work<MD5_zeroes>>(work_queue),
             boost::queue_front<Result>(result_queue),
             2 * nthreads, block_size,
-            [zeroes](md5::State state) {
-                return MD5_zeroes(state, zeroes.value());
-            });
+            MD5_zeroes(zeroes.value()));
 
     auto time_end = std::chrono::high_resolution_clock::now();
 
