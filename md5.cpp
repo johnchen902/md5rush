@@ -42,11 +42,13 @@ namespace md5 {
         1u << 31, 1 << 30, 1 << 29, 1 << 28, 1 << 27, 1 << 26, 1 << 25, 1 << 24,
     };
 
-    State update(State state, const uint32_t *m) {
+    template<typename State_type>
+    constexpr State_type update_impl(State_type state,
+            const typename State_type::vector_type *m) {
         auto [a, b, c, d] = state;
 #define MD5_STATE_UPDATE_LOOP(IBEGIN, IEND, FEXPR, GEXPR) \
         for (uint32_t i = (IBEGIN); i < (IEND); i++) { \
-            uint32_t f = (FEXPR), g = (GEXPR); \
+            auto f = (FEXPR), g = (GEXPR); \
             f += a + k[i] + m[g]; \
             a = d; \
             d = c; \
@@ -65,6 +67,19 @@ namespace md5 {
         state.c += c;
         state.d += d;
         return state;
+    }
+
+    State update(State state, const uint32_t *m) {
+        return update_impl(state, m);
+    }
+    State_v4 update(State_v4 state, const amd64magic::v4uint32_t *m) {
+        return update_impl(state, m);
+    }
+    State_v8 update(State_v8 state, const amd64magic::v8uint32_t *m) {
+        return update_impl(state, m);
+    }
+    State_v16 update(State_v16 state, const amd64magic::v16uint32_t *m) {
+        return update_impl(state, m);
     }
 
     State md5(const uint32_t *d, size_t nbits) {

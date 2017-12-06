@@ -16,6 +16,7 @@
 #include <unistd.h> // getopt
 #include <vector>
 
+#include "amd64magic.h"
 #include "md5.h"
 
 namespace {
@@ -47,16 +48,23 @@ struct Result {
 template<typename Iterator>
 auto add_sequence(Iterator first, Iterator last,
         typename std::iterator_traits<Iterator>::value_type addend) {
-    for (; addend && first != last; ++first)
-        addend = __builtin_add_overflow(*first, addend, std::addressof(*first));
+    constexpr bool is_scalar = amd64magic::width<
+        typename std::iterator_traits<Iterator>::value_type> == 1;
+    for (; amd64magic::vector_any(addend) && first != last; ++first) {
+        *first += addend;
+        if constexpr (is_scalar)
+            addend = *first < addend;
+        else
+            addend = -(*first < addend);
+    }
     return addend;
 }
 
 template<typename Container>
 bool next_work_array(Container &array, size_t begin, size_t end,
         typename Container::value_type n = 1) {
-    return add_sequence(std::begin(array) + begin,
-            std::begin(array) + end, n) == 0;
+    return !amd64magic::vector_any(add_sequence(std::begin(array) + begin,
+            std::begin(array) + end, n));
 }
 
 template<typename Predicate>
@@ -72,22 +80,48 @@ std::pair<Work<Predicate>, Work<Predicate>> split_work(
 }
 
 /**
- * Find 'next' treasure satisfying pred(work.array).
+ * Find 'next' treasure.
+ *
+ * Sequence overflow is ignored silently.
  */
-template<typename Predicate>
+template<typename State_type, typename Predicate>
 Result next_treasure(Work<Predicate> work) {
+    using vector_type = typename State_type::vector_type;
+    constexpr unsigned width = amd64magic::width<vector_type>;
+    // make (work.max_count - count) multiple of width
     size_t count = 0;
-    while (count < work.max_count) {
+    while ((work.max_count - count) % width) {
         count++;
         if (work.pred(md5::update(work.init_state, work.array.data())))
             return Result(count, work.array);
-        if (!next_work_array(work.array, work.mutable_begin, work.mutable_end))
-            break;
+        next_work_array(work.array, work.mutable_begin, work.mutable_end);
+    }
+
+    State_type init_state = work.init_state;
+    std::array<vector_type, 16> array;
+    for (unsigned i = 0; i < width; i++) {
+        for (unsigned j = 0; j < array.size(); j++)
+            array[j][i] = work.array[j];
+        next_work_array(work.array, work.mutable_begin, work.mutable_end);
+    }
+
+    while (count < work.max_count) {
+        count += width;
+        State_type state = md5::update(init_state, array.data());
+        for (unsigned i = 0; i < width; i++) {
+            if (work.pred(state[i])) {
+                for (unsigned j = 0; j < array.size(); j++)
+                    work.array[j] = array[j][i];
+                return Result(count, work.array);
+            }
+        }
+        next_work_array(array, work.mutable_begin, work.mutable_end,
+                vector_type{} + width);
     }
     return Result(count);
 }
 
-template<typename Predicate>
+template<typename Vector_type, typename Predicate>
 void next_treasure_worker(
         boost::queue_front<Work<Predicate>> work_queue,
         boost::queue_back<Result> result_queue) {
@@ -96,7 +130,7 @@ void next_treasure_worker(
         auto status = work_queue.wait_pull(work);
         if (status != boost::queue_op_status::success)
             break;
-        result_queue.push(next_treasure(work));
+        result_queue.push(next_treasure<Vector_type>(work));
     }
 }
 
@@ -373,7 +407,7 @@ int main(int argc, char **argv) {
 
     std::cout << "Using " << nthreads << " threads." << std::endl;
     for (unsigned i = 0; i < nthreads; i++)
-        threads.emplace_back(next_treasure_worker<MD5_zeroes>,
+        threads.emplace_back(next_treasure_worker<md5::State_vfast, MD5_zeroes>,
             boost::queue_front<Work<MD5_zeroes>>(work_queue),
             boost::queue_back<Result>(result_queue));
 
