@@ -27,16 +27,31 @@ namespace amd64magic {
     constexpr size_t width = sizeof(T) / sizeof(uint32_t);
 
     template<typename T>
-    constexpr bool vector_any(T x);
-
-    template<>
-    constexpr bool vector_any<uint32_t>(uint32_t x) { return x; }
-
-    template<>
-    inline bool vector_any<v8uint32_t>(v8uint32_t x) {
-        return !_mm256_testz_si256((__m256i) x, (__m256i) x);
+    constexpr bool is_all_zero(T x) {
+        return !x;
     }
 
-    // TODO implement vector_any for v4uint32_t and v16uint32_t
+    template<>
+    inline bool is_all_zero<v4uint32_t>(v4uint32_t x) {
+#if __SSE4_1__
+        return _mm_testz_si128((__m128i) x, (__m128i) x);
+#else
+        // https://stackoverflow.com/a/10250306
+        return _mm_movemask_epi8(_mm_cmpeq_epi8(
+                    (__m128i) x, _mm_setzero_si128())) == 0xFFFF;
+#endif
+    }
+
+    template<>
+    inline bool is_all_zero<v8uint32_t>(v8uint32_t x) {
+        return _mm256_testz_si256((__m256i) x, (__m256i) x);
+    }
+
+#if 0
+    template<>
+    inline bool is_all_zero<v16uint32_t>(v16uint32_t x) {
+        // TODO implement
+    }
+#endif
 }
 #endif // MD5RUSH_AMD64MAGIC_H

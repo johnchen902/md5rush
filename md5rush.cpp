@@ -50,7 +50,7 @@ auto add_sequence(Iterator first, Iterator last,
         typename std::iterator_traits<Iterator>::value_type addend) {
     constexpr bool is_scalar = amd64magic::width<
         typename std::iterator_traits<Iterator>::value_type> == 1;
-    for (; amd64magic::vector_any(addend) && first != last; ++first) {
+    for (; !amd64magic::is_all_zero(addend) && first != last; ++first) {
         *first += addend;
         if constexpr (is_scalar)
             addend = *first < addend;
@@ -63,7 +63,7 @@ auto add_sequence(Iterator first, Iterator last,
 template<typename Container>
 bool next_work_array(Container &array, size_t begin, size_t end,
         typename Container::value_type n = 1) {
-    return !amd64magic::vector_any(add_sequence(std::begin(array) + begin,
+    return amd64magic::is_all_zero(add_sequence(std::begin(array) + begin,
             std::begin(array) + end, n));
 }
 
