@@ -1,4 +1,7 @@
-# Dependency
+# MD5Rush
+Find md5 hashes prefixed with zeroes.
+
+## Dependency
 * Boost
 * Fix amd64magic.h if you have AVX512 or don't have AVX2
 ```
@@ -14,7 +17,7 @@ libc.so.6
 librt.so.1
 ```
 
-# Usage
+## Usage
 ```
 $ ./md5rush -h
 Usage: ./md5rush [OPTION]...
