@@ -3,7 +3,7 @@ Find md5 hashes prefixed with zeroes.
 
 ## Dependency
 * Boost
-* Fix amd64magic.h if you have AVX512 or don't have AVX2
+* Fix amd64magic.h if you'd like to use AVX512
 ```
 $ ldd ./md5sum | grep -oP '\S*(?= =>)'
 libpthread.so.0
