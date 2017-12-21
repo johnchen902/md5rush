@@ -214,12 +214,39 @@ def find_treasure(generator, mask, slave_factory):
                 estimated_speed = estimate_speed(start_time, slaves)
                 print('\033[FEstimated speed: %g hashes/second' % estimated_speed)
 
+def main_zero(prefix, zeroes, slave_config, output_file):
+    generator = PatternGenerator(prefix)
+    mask = nzero_mask(zeroes)
+    factory = SlaveFactory(slave_config)
+
+    start_time = datetime.datetime.now()
+    treasure = find_treasure(generator, mask, factory)
+    end_time = datetime.datetime.now()
+    time_used = end_time - start_time
+
+    print('Treasure (repr):', repr(treasure))
+    print('Treasure (hex):', treasure.hex())
+    print('Hash:', hashlib.md5(treasure).hexdigest())
+    print('Time used:', time_used)
+    if output_file is not None:
+        if output_file.seekable():
+            output_file.seek(0)
+            output_file.truncate()
+        output_file.write(treasure)
+        output_file.flush()
+        print('Treasure saved to', output_file.name)
+
+    return treasure
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('slave_config', type=argparse.FileType('r'),
                         help='JSON file listing all slaves')
-    parser.add_argument('-z', '--zeroes', type=int, required=True,
-                        help='number of zeroes to look for (mandantory)')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--rush', action='store_true',
+                       help='original md5rush mode')
+    group.add_argument('-z', '--zeroes', type=int,
+                       help='number of zeroes to look for')
     parser.add_argument('-p', '--prefix-file', type=argparse.FileType('rb'),
                         help='read prefix from PREFIX_FILE')
     parser.add_argument('-o', '--output-file', type=argparse.FileType('wb'),
@@ -235,23 +262,13 @@ def main():
         with args.prefix_file:
             prefix = args.prefix_file.read()
 
-    generator = PatternGenerator(prefix)
-    mask = nzero_mask(args.zeroes)
-    factory = SlaveFactory(slave_config)
-
-    start_time = datetime.datetime.now()
-    treasure = find_treasure(generator, mask, factory)
-    end_time = datetime.datetime.now()
-    time_used = end_time - start_time
-
-    print('Treasure found!')
-    print('Treasure (repr):', repr(treasure))
-    print('Treasure (hex):', treasure.hex())
-    print('Hash:', hashlib.md5(treasure).hexdigest())
-    print('Time used:', time_used)
-    if args.output_file:
-        args.output_file.write(treasure)
-        print('Treasure saved to', args.output_file.name)
+    if args.rush:
+        for zeroes in range(1, 33):
+            print('Searching for %d-treasure...' % zeroes)
+            prefix = main_zero(prefix, zeroes, slave_config, args.output_file)
+            print()
+    else:
+        main_zero(prefix, args.zeroes, slave_config, args.output_file)
 
 if __name__ == '__main__':
     main()
