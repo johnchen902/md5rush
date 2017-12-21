@@ -67,6 +67,8 @@ class Slave:
         self.stdout = stdout
         self.name = config.get('name')
         self.block_size = config.get('block-size', 2 ** 32)
+        self.hashes = 0
+        self.last_hashes_update = None
         self.pattern_queue = []
     def register_to(self, selector):
         """Register this slave to the selector"""
@@ -76,10 +78,12 @@ class Slave:
         result = self.stdout.readline()
         success, index = result.split(b' ')
         pattern = self.pattern_queue.pop(0)
-        if int(success):
-            return pattern, int(index)
-        else:
-            return pattern, None
+        index = int(index) if int(success) else None
+
+        if index is None:
+            self.hashes += pattern.count
+            self.last_hashes_update = datetime.datetime.now()
+        return pattern, index
     def write_work(self, pattern, mask):
         """Write a work to the slave"""
         work = pattern.format_work(mask)
@@ -179,14 +183,27 @@ class PatternGenerator:
                     pattern[p3:p4] = y.to_bytes(p4 - p3, byteorder='little')
                     yield WorkPattern(bytes(pattern), length, p2, 2 ** 32)
 
+def estimate_speed(start_time, slaves):
+    """Estimated hashes per second"""
+    speed = 0
+    for slave in slaves:
+        if slave.last_hashes_update is not None:
+            time = slave.last_hashes_update - start_time
+            speed += slave.hashes / time.total_seconds()
+    return speed
+
 def find_treasure(generator, mask, slave_factory):
     """Find first treasure"""
+
     with selectors.DefaultSelector() as selector, \
             slave_factory.create_slaves() as slaves:
+        start_time = datetime.datetime.now()
+
         for slave in slaves:
             slave.register_to(selector)
             slave.write_work(generator.next(slave.block_size), mask)
 
+        print('Estimated speed: None')
         while True:
             for key, _ in selector.select():
                 slave = key.data
@@ -194,6 +211,8 @@ def find_treasure(generator, mask, slave_factory):
                 if index is not None:
                     return pattern.to_treasure(index)
                 slave.write_work(generator.next(slave.block_size), mask)
+                estimated_speed = estimate_speed(start_time, slaves)
+                print('\033[FEstimated speed: %g hashes/second' % estimated_speed)
 
 def main():
     parser = argparse.ArgumentParser()
