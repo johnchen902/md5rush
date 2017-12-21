@@ -1,4 +1,4 @@
-md5rush
-md5sum
+md5rush-simd/md5rush-simd
 *.o
 treasure-*
+__pycache__
