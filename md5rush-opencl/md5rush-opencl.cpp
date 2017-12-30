@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <iostream>
 #include <optional>
@@ -104,6 +105,7 @@ struct My_context {
     cl_context context;
     cl_kernel kernel_md5rush, kernel_ffz;
     cl_command_queue cmdqueue;
+    size_t ffz_work_group_size;
 };
 
 struct Work {
@@ -194,12 +196,12 @@ __kernel void md5rush(__constant struct Work *work, __global uint *result) {
 }
 __kernel void find_first_zero(__global uint *a, ulong size,
         __global ulong *result) {
-    for (unsigned long i = 0; i < size; i++)
-        if (a[i] == 0) {
-            *result = i;
-            return;
-        }
-    *result = size;
+    ulong ans = size;
+    for (ulong i = get_global_id(0); i < size; i += get_global_size(0)) {
+        ulong newans = a[i] ? size : i;
+        ans = ans < newans ? ans : newans;
+    }
+    result[get_global_id(0)] = ans;
 }
 )";
 
@@ -209,6 +211,7 @@ std::optional<uint32_t> md5rush(const Work &work, const My_context &context) {
         return std::nullopt;
     // Trying duplicate messages is a waste.
     uint64_t count = std::min(work.count, 0x100000000u);
+    size_t ffz_count = context.ffz_work_group_size;
 
     cl_int err;
     cl_mem mem_work = clCreateBuffer(context.context,
@@ -231,7 +234,7 @@ std::optional<uint32_t> md5rush(const Work &work, const My_context &context) {
 
     cl_mem mem_result = clCreateBuffer(context.context,
             CL_MEM_WRITE_ONLY | CL_MEM_HOST_READ_ONLY,
-            8, nullptr, &err);
+            8 * ffz_count, nullptr, &err);
     if (check_cl_error(err))
         return std::nullopt;
     Scope_exit release_mem_result([mem_result] () {
@@ -258,15 +261,18 @@ std::optional<uint32_t> md5rush(const Work &work, const My_context &context) {
     if (check_cl_error(clSetKernelArg(
             context.kernel_ffz, 2, sizeof(cl_mem), &mem_result)))
         return std::nullopt;
-    if (check_cl_error(clEnqueueTask(
-            context.cmdqueue, context.kernel_ffz, 0, nullptr, nullptr)))
+    if (check_cl_error(clEnqueueNDRangeKernel(
+            context.cmdqueue, context.kernel_ffz, 1,
+            nullptr, &ffz_count, nullptr, 0, nullptr, nullptr)))
         return std::nullopt;
 
-    uint64_t result;
+    std::vector<uint64_t> vec_result(ffz_count, count);
     if (check_cl_error(clEnqueueReadBuffer(
-            context.cmdqueue, mem_result, CL_TRUE, 0, 8, &result,
-            0, nullptr, nullptr)))
+            context.cmdqueue, mem_result, CL_TRUE, 0, 8 * ffz_count,
+            vec_result.data(), 0, nullptr, nullptr)))
         return std::nullopt;
+
+    uint64_t result = *std::min_element(vec_result.begin(), vec_result.end());
     if (result >= count)
         return std::nullopt;
 
@@ -345,6 +351,15 @@ int main() {
         check_cl_error(clReleaseKernel(kernel_ffz));
     });
 
+    size_t ffz_work_group_size = 0;
+    if (check_cl_error(clGetKernelWorkGroupInfo(kernel_ffz, *device,
+            CL_KERNEL_WORK_GROUP_SIZE, sizeof(ffz_work_group_size),
+            &ffz_work_group_size, nullptr))) {
+        std::cerr << "Failed to get CL_KERNEL_WORK_GROUP_SIZE"
+            " of \"find_first_zero\"." << std::endl;
+        return 1;
+    }
+
     cl_command_queue cmdqueue = create_command_queue(context, *device);
     if (!cmdqueue) {
         std::cerr << "Failed to create command queue." << std::endl;
@@ -359,6 +374,7 @@ int main() {
         context,
         kernel_md5rush, kernel_ffz,
         cmdqueue,
+        ffz_work_group_size,
     };
     while (std::cin >> work) {
         std::optional<uint32_t> result = md5rush(work, my_context);
