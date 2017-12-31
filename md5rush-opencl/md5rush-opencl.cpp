@@ -105,6 +105,7 @@ struct My_context {
     cl_context context;
     cl_kernel kernel_md5rush, kernel_ffz;
     cl_command_queue cmdqueue;
+    cl_uint max_compute_units;
     size_t ffz_work_group_size;
 };
 
@@ -226,13 +227,20 @@ __kernel void md5rush(__constant struct Work *work, __global uint *result) {
     result[get_global_id(0)] = a | b | c | d;
 }
 __kernel void find_first_zero(__global uint *a, ulong size,
-        __global ulong *result) {
+        __local ulong *buffer, __global ulong *result) {
     ulong ans = size;
-    for (ulong i = get_global_id(0); i < size; i += get_global_size(0)) {
-        ulong newans = a[i] ? size : i;
-        ans = ans < newans ? ans : newans;
+    for (ulong i = get_global_id(0); i < size; i += get_global_size(0))
+        ans = min(ans, a[i] ? size : i);
+
+    uint local_id = get_local_id(0);
+    buffer[local_id] = ans;
+    for (uint stride = get_local_size(0) >> 1; stride; stride >>= 1) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (local_id < stride)
+            buffer[local_id] = min(buffer[local_id], buffer[local_id + stride]);
     }
-    result[get_global_id(0)] = ans;
+    if (local_id == 0)
+        result[get_group_id(0)] = buffer[0];
 }
 )";
 
@@ -242,7 +250,8 @@ std::optional<uint32_t> md5rush(const Work &work, const My_context &context) {
         return std::nullopt;
     // Trying duplicate messages is a waste.
     uint64_t count = std::min(work.count, 0x100000000u);
-    size_t ffz_count = context.ffz_work_group_size;
+    size_t ffz_work_group_size = context.ffz_work_group_size;
+    size_t ffz_work_items = context.max_compute_units * ffz_work_group_size;
 
     cl_int err;
     cl_mem mem_work = clCreateBuffer(context.context,
@@ -265,7 +274,7 @@ std::optional<uint32_t> md5rush(const Work &work, const My_context &context) {
 
     cl_mem mem_result = clCreateBuffer(context.context,
             CL_MEM_WRITE_ONLY | CL_MEM_HOST_READ_ONLY,
-            8 * ffz_count, nullptr, &err);
+            8 * context.max_compute_units, nullptr, &err);
     if (check_cl_error(err))
         return std::nullopt;
     Scope_exit release_mem_result([mem_result] () {
@@ -290,17 +299,22 @@ std::optional<uint32_t> md5rush(const Work &work, const My_context &context) {
             context.kernel_ffz, 1, 8, &count)))
         return std::nullopt;
     if (check_cl_error(clSetKernelArg(
-            context.kernel_ffz, 2, sizeof(cl_mem), &mem_result)))
+            context.kernel_ffz, 2, 8 * ffz_work_group_size, nullptr)))
+        return std::nullopt;
+    if (check_cl_error(clSetKernelArg(
+            context.kernel_ffz, 3, sizeof(cl_mem), &mem_result)))
         return std::nullopt;
     if (check_cl_error(clEnqueueNDRangeKernel(
             context.cmdqueue, context.kernel_ffz, 1,
-            nullptr, &ffz_count, nullptr, 0, nullptr, nullptr)))
+            nullptr, &ffz_work_items, &ffz_work_group_size, 0,
+            nullptr, nullptr)))
         return std::nullopt;
 
-    std::vector<uint64_t> vec_result(ffz_count, count);
+    std::vector<uint64_t> vec_result(context.max_compute_units, count);
     if (check_cl_error(clEnqueueReadBuffer(
-            context.cmdqueue, mem_result, CL_TRUE, 0, 8 * ffz_count,
-            vec_result.data(), 0, nullptr, nullptr)))
+            context.cmdqueue, mem_result, CL_TRUE,
+            0, 8 * vec_result.size(), vec_result.data(),
+            0, nullptr, nullptr)))
         return std::nullopt;
 
     uint64_t result = *std::min_element(vec_result.begin(), vec_result.end());
@@ -382,6 +396,14 @@ int main() {
         check_cl_error(clReleaseKernel(kernel_ffz));
     });
 
+    cl_uint max_compute_units = 0;
+    if (check_cl_error(clGetDeviceInfo(*device,
+            CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(max_compute_units),
+            &max_compute_units, nullptr))) {
+        std::cerr << "Failed to get CL_DEVICE_MAX_COMPUTE_UNITS" << std::endl;
+        return 1;
+    }
+
     size_t ffz_work_group_size = 0;
     if (check_cl_error(clGetKernelWorkGroupInfo(kernel_ffz, *device,
             CL_KERNEL_WORK_GROUP_SIZE, sizeof(ffz_work_group_size),
@@ -405,6 +427,7 @@ int main() {
         context,
         kernel_md5rush, kernel_ffz,
         cmdqueue,
+        max_compute_units,
         ffz_work_group_size,
     };
     while (std::cin >> work) {
