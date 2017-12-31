@@ -163,17 +163,14 @@ struct Work {
 };
 
 __kernel void md5rush(__constant struct Work *work, __global uint *result) {
-    uint data[16];
-    for (uint i = 0; i < 16; i++)
-        data[i] = work->data[i];
-    data[work->mutable_index] += get_global_id(0);
     uint a = work->init_state[0];
     uint b = work->init_state[1];
     uint c = work->init_state[2];
     uint d = work->init_state[3];
 #define MD5_STATE_UPDATE_LOOP(IBEGIN, IEND, FEXPR, GEXPR) \
     for (uint i = (IBEGIN); i < (IEND); i++) { \
-        uint f = (FEXPR) + a + k[i] + data[(GEXPR)]; \
+        uint f = (FEXPR) + a + k[i] + work->data[(GEXPR)] + \
+            ((GEXPR) == work->mutable_index ? get_global_id(0) : 0); \
         a = d; \
         d = c; \
         c = b; \
