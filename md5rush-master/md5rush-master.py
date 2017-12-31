@@ -29,7 +29,7 @@ class WorkPattern:
         """With mask, get the 26 integers slave understands"""
         return md5.prefix_state(self.pattern[:-64]) + mask + \
                 struct.unpack('<16I', self.pattern[-64:]) + \
-                (self.offset // 4, self.count)
+                (self.offset // 4 % 16, self.count)
 
     def to_treasure(self, value):
         """Get the treasure with 'pattern[index] set to value'"""

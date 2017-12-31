@@ -26,6 +26,9 @@ SHIFT = (
 )
 INIT_STATE = (0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476)
 
+def u32add(lhs, rhs):
+    return (lhs + rhs) & 0xffffffff
+
 def next_state(state, message):
     a, b, c, d = state
     for i in range(64):
@@ -43,9 +46,9 @@ def next_state(state, message):
             g = 7 * i % 16
         f = (f + a + ADDEND[i] + message[g]) & 0xffffffff
         a, c, d = d, b, c
-        b = (b + ((f << SHIFT[i]) | (f >> (32 - SHIFT[i])))) & 0xffffffff
+        b = u32add(b, (f << SHIFT[i]) | (f >> (32 - SHIFT[i])))
     a0, b0, c0, d0 = state
-    return (a + a0, b + b0, c + c0, d + d0)
+    return (u32add(a, a0), u32add(b, b0), u32add(c, c0), u32add(d, d0))
 
 def pad(data: bytes):
     nbits = len(data) * 8
@@ -61,5 +64,5 @@ def prefix_state(message: bytes):
         raise ValueError('len(message) not multiple of 64')
     state = INIT_STATE
     for i in range(0, len(message), 64):
-        state = next_state(state, struct.pack('<16I', messages[i, i + 64]))
+        state = next_state(state, struct.unpack('<16I', message[i : i + 64]))
     return state
