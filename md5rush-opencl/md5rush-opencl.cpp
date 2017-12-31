@@ -105,6 +105,7 @@ struct My_context {
     cl_context context;
     cl_kernel kernel_md5rush, kernel_ffz;
     cl_command_queue cmdqueue;
+    cl_uint max_compute_units;
     size_t ffz_work_group_size;
 };
 
@@ -128,32 +129,6 @@ std::istream &operator >> (std::istream &in, Work &work) {
 }
 
 constexpr const char *md5rush_source = R"(
-__constant uint s[64] = {
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-    5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
-    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-};
-
-__constant uint k[64] = {
-    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
-    0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
-    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
-    0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
-    0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
-    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
-    0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
-    0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
-    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
-};
-
 struct Work {
     uint init_state[4];
     uint mask[4];
@@ -163,27 +138,84 @@ struct Work {
 };
 
 __kernel void md5rush(__constant struct Work *work, __global uint *result) {
-    uint data[16];
-    for (uint i = 0; i < 16; i++)
-        data[i] = work->data[i];
-    data[work->mutable_index] += get_global_id(0);
     uint a = work->init_state[0];
     uint b = work->init_state[1];
     uint c = work->init_state[2];
     uint d = work->init_state[3];
-#define MD5_STATE_UPDATE_LOOP(IBEGIN, IEND, FEXPR, GEXPR) \
-    for (uint i = (IBEGIN); i < (IEND); i++) { \
-        uint f = (FEXPR) + a + k[i] + data[(GEXPR)]; \
+#define MD5_ITERATION(F, G, K, S) \
+    do { \
+        uint f = (F) + a + (K) + work->data[(G)] + \
+            ((G) == work->mutable_index ? get_global_id(0) : 0); \
         a = d; \
         d = c; \
         c = b; \
-        b += (f << s[i]) | (f >> (32 - s[i])); \
-    }
-    MD5_STATE_UPDATE_LOOP( 0, 16, (b & c) | (~b & d),      i          )
-    MD5_STATE_UPDATE_LOOP(16, 32, (d & b) | (~d & c), (5 * i + 1) % 16)
-    MD5_STATE_UPDATE_LOOP(32, 48, b ^ c ^ d         , (3 * i + 5) % 16)
-    MD5_STATE_UPDATE_LOOP(48, 64, c ^ (b | ~d)      ,  7 * i      % 16)
-#undef MD5_STATE_UPDATE_LOOP
+        b += (f << (S)) | (f >> (32 - (S))); \
+    } while (0)
+    MD5_ITERATION((b & c) | (~b & d),  0, 3614090360,  7);
+    MD5_ITERATION((b & c) | (~b & d),  1, 3905402710, 12);
+    MD5_ITERATION((b & c) | (~b & d),  2,  606105819, 17);
+    MD5_ITERATION((b & c) | (~b & d),  3, 3250441966, 22);
+    MD5_ITERATION((b & c) | (~b & d),  4, 4118548399,  7);
+    MD5_ITERATION((b & c) | (~b & d),  5, 1200080426, 12);
+    MD5_ITERATION((b & c) | (~b & d),  6, 2821735955, 17);
+    MD5_ITERATION((b & c) | (~b & d),  7, 4249261313, 22);
+    MD5_ITERATION((b & c) | (~b & d),  8, 1770035416,  7);
+    MD5_ITERATION((b & c) | (~b & d),  9, 2336552879, 12);
+    MD5_ITERATION((b & c) | (~b & d), 10, 4294925233, 17);
+    MD5_ITERATION((b & c) | (~b & d), 11, 2304563134, 22);
+    MD5_ITERATION((b & c) | (~b & d), 12, 1804603682,  7);
+    MD5_ITERATION((b & c) | (~b & d), 13, 4254626195, 12);
+    MD5_ITERATION((b & c) | (~b & d), 14, 2792965006, 17);
+    MD5_ITERATION((b & c) | (~b & d), 15, 1236535329, 22);
+    MD5_ITERATION((d & b) | (~d & c),  1, 4129170786,  5);
+    MD5_ITERATION((d & b) | (~d & c),  6, 3225465664,  9);
+    MD5_ITERATION((d & b) | (~d & c), 11,  643717713, 14);
+    MD5_ITERATION((d & b) | (~d & c),  0, 3921069994, 20);
+    MD5_ITERATION((d & b) | (~d & c),  5, 3593408605,  5);
+    MD5_ITERATION((d & b) | (~d & c), 10,   38016083,  9);
+    MD5_ITERATION((d & b) | (~d & c), 15, 3634488961, 14);
+    MD5_ITERATION((d & b) | (~d & c),  4, 3889429448, 20);
+    MD5_ITERATION((d & b) | (~d & c),  9,  568446438,  5);
+    MD5_ITERATION((d & b) | (~d & c), 14, 3275163606,  9);
+    MD5_ITERATION((d & b) | (~d & c),  3, 4107603335, 14);
+    MD5_ITERATION((d & b) | (~d & c),  8, 1163531501, 20);
+    MD5_ITERATION((d & b) | (~d & c), 13, 2850285829,  5);
+    MD5_ITERATION((d & b) | (~d & c),  2, 4243563512,  9);
+    MD5_ITERATION((d & b) | (~d & c),  7, 1735328473, 14);
+    MD5_ITERATION((d & b) | (~d & c), 12, 2368359562, 20);
+    MD5_ITERATION(b ^ c ^ d         ,  5, 4294588738,  4);
+    MD5_ITERATION(b ^ c ^ d         ,  8, 2272392833, 11);
+    MD5_ITERATION(b ^ c ^ d         , 11, 1839030562, 16);
+    MD5_ITERATION(b ^ c ^ d         , 14, 4259657740, 23);
+    MD5_ITERATION(b ^ c ^ d         ,  1, 2763975236,  4);
+    MD5_ITERATION(b ^ c ^ d         ,  4, 1272893353, 11);
+    MD5_ITERATION(b ^ c ^ d         ,  7, 4139469664, 16);
+    MD5_ITERATION(b ^ c ^ d         , 10, 3200236656, 23);
+    MD5_ITERATION(b ^ c ^ d         , 13,  681279174,  4);
+    MD5_ITERATION(b ^ c ^ d         ,  0, 3936430074, 11);
+    MD5_ITERATION(b ^ c ^ d         ,  3, 3572445317, 16);
+    MD5_ITERATION(b ^ c ^ d         ,  6,   76029189, 23);
+    MD5_ITERATION(b ^ c ^ d         ,  9, 3654602809,  4);
+    MD5_ITERATION(b ^ c ^ d         , 12, 3873151461, 11);
+    MD5_ITERATION(b ^ c ^ d         , 15,  530742520, 16);
+    MD5_ITERATION(b ^ c ^ d         ,  2, 3299628645, 23);
+    MD5_ITERATION(c ^ (b | ~d)      ,  0, 4096336452,  6);
+    MD5_ITERATION(c ^ (b | ~d)      ,  7, 1126891415, 10);
+    MD5_ITERATION(c ^ (b | ~d)      , 14, 2878612391, 15);
+    MD5_ITERATION(c ^ (b | ~d)      ,  5, 4237533241, 21);
+    MD5_ITERATION(c ^ (b | ~d)      , 12, 1700485571,  6);
+    MD5_ITERATION(c ^ (b | ~d)      ,  3, 2399980690, 10);
+    MD5_ITERATION(c ^ (b | ~d)      , 10, 4293915773, 15);
+    MD5_ITERATION(c ^ (b | ~d)      ,  1, 2240044497, 21);
+    MD5_ITERATION(c ^ (b | ~d)      ,  8, 1873313359,  6);
+    MD5_ITERATION(c ^ (b | ~d)      , 15, 4264355552, 10);
+    MD5_ITERATION(c ^ (b | ~d)      ,  6, 2734768916, 15);
+    MD5_ITERATION(c ^ (b | ~d)      , 13, 1309151649, 21);
+    MD5_ITERATION(c ^ (b | ~d)      ,  4, 4149444226,  6);
+    MD5_ITERATION(c ^ (b | ~d)      , 11, 3174756917, 10);
+    MD5_ITERATION(c ^ (b | ~d)      ,  2,  718787259, 15);
+    MD5_ITERATION(c ^ (b | ~d)      ,  9, 3951481745, 21);
+#undef MD5_ITERATION
     a += work->init_state[0];
     b += work->init_state[1];
     c += work->init_state[2];
@@ -195,13 +227,20 @@ __kernel void md5rush(__constant struct Work *work, __global uint *result) {
     result[get_global_id(0)] = a | b | c | d;
 }
 __kernel void find_first_zero(__global uint *a, ulong size,
-        __global ulong *result) {
+        __local ulong *buffer, __global ulong *result) {
     ulong ans = size;
-    for (ulong i = get_global_id(0); i < size; i += get_global_size(0)) {
-        ulong newans = a[i] ? size : i;
-        ans = ans < newans ? ans : newans;
+    for (ulong i = get_global_id(0); i < size; i += get_global_size(0))
+        ans = min(ans, a[i] ? size : i);
+
+    uint local_id = get_local_id(0);
+    buffer[local_id] = ans;
+    for (uint stride = get_local_size(0) >> 1; stride; stride >>= 1) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (local_id < stride)
+            buffer[local_id] = min(buffer[local_id], buffer[local_id + stride]);
     }
-    result[get_global_id(0)] = ans;
+    if (local_id == 0)
+        result[get_group_id(0)] = buffer[0];
 }
 )";
 
@@ -211,7 +250,8 @@ std::optional<uint32_t> md5rush(const Work &work, const My_context &context) {
         return std::nullopt;
     // Trying duplicate messages is a waste.
     uint64_t count = std::min(work.count, 0x100000000u);
-    size_t ffz_count = context.ffz_work_group_size;
+    size_t ffz_work_group_size = context.ffz_work_group_size;
+    size_t ffz_work_items = context.max_compute_units * ffz_work_group_size;
 
     cl_int err;
     cl_mem mem_work = clCreateBuffer(context.context,
@@ -234,7 +274,7 @@ std::optional<uint32_t> md5rush(const Work &work, const My_context &context) {
 
     cl_mem mem_result = clCreateBuffer(context.context,
             CL_MEM_WRITE_ONLY | CL_MEM_HOST_READ_ONLY,
-            8 * ffz_count, nullptr, &err);
+            8 * context.max_compute_units, nullptr, &err);
     if (check_cl_error(err))
         return std::nullopt;
     Scope_exit release_mem_result([mem_result] () {
@@ -259,17 +299,22 @@ std::optional<uint32_t> md5rush(const Work &work, const My_context &context) {
             context.kernel_ffz, 1, 8, &count)))
         return std::nullopt;
     if (check_cl_error(clSetKernelArg(
-            context.kernel_ffz, 2, sizeof(cl_mem), &mem_result)))
+            context.kernel_ffz, 2, 8 * ffz_work_group_size, nullptr)))
+        return std::nullopt;
+    if (check_cl_error(clSetKernelArg(
+            context.kernel_ffz, 3, sizeof(cl_mem), &mem_result)))
         return std::nullopt;
     if (check_cl_error(clEnqueueNDRangeKernel(
             context.cmdqueue, context.kernel_ffz, 1,
-            nullptr, &ffz_count, nullptr, 0, nullptr, nullptr)))
+            nullptr, &ffz_work_items, &ffz_work_group_size, 0,
+            nullptr, nullptr)))
         return std::nullopt;
 
-    std::vector<uint64_t> vec_result(ffz_count, count);
+    std::vector<uint64_t> vec_result(context.max_compute_units, count);
     if (check_cl_error(clEnqueueReadBuffer(
-            context.cmdqueue, mem_result, CL_TRUE, 0, 8 * ffz_count,
-            vec_result.data(), 0, nullptr, nullptr)))
+            context.cmdqueue, mem_result, CL_TRUE,
+            0, 8 * vec_result.size(), vec_result.data(),
+            0, nullptr, nullptr)))
         return std::nullopt;
 
     uint64_t result = *std::min_element(vec_result.begin(), vec_result.end());
@@ -351,6 +396,14 @@ int main() {
         check_cl_error(clReleaseKernel(kernel_ffz));
     });
 
+    cl_uint max_compute_units = 0;
+    if (check_cl_error(clGetDeviceInfo(*device,
+            CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(max_compute_units),
+            &max_compute_units, nullptr))) {
+        std::cerr << "Failed to get CL_DEVICE_MAX_COMPUTE_UNITS" << std::endl;
+        return 1;
+    }
+
     size_t ffz_work_group_size = 0;
     if (check_cl_error(clGetKernelWorkGroupInfo(kernel_ffz, *device,
             CL_KERNEL_WORK_GROUP_SIZE, sizeof(ffz_work_group_size),
@@ -374,6 +427,7 @@ int main() {
         context,
         kernel_md5rush, kernel_ffz,
         cmdqueue,
+        max_compute_units,
         ffz_work_group_size,
     };
     while (std::cin >> work) {
