@@ -36,6 +36,10 @@ optional arguments:
         "name": "simd-cpu1",
         "command": "taskset 0x02 chrt -b 0 nice md5rush-simd/md5rush-simd",
         "block-size": 16777216
+    }, {
+        "name": "opencl",
+        "command": "md5rush-opencl/md5rush-opencl",
+        "block-size": 16777216
     }
 ]
 ```
