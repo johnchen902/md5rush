@@ -176,9 +176,13 @@ __kernel void md5rush(__constant struct Work *work, __global uint *result) {
         c = b; \
         b += (f << s[i]) | (f >> (32 - s[i])); \
     }
+#pragma unroll
     MD5_STATE_UPDATE_LOOP( 0, 16, (b & c) | (~b & d),      i          )
+#pragma unroll
     MD5_STATE_UPDATE_LOOP(16, 32, (d & b) | (~d & c), (5 * i + 1) % 16)
+#pragma unroll
     MD5_STATE_UPDATE_LOOP(32, 48, b ^ c ^ d         , (3 * i + 5) % 16)
+#pragma unroll
     MD5_STATE_UPDATE_LOOP(48, 64, c ^ (b | ~d)      ,  7 * i      % 16)
 #undef MD5_STATE_UPDATE_LOOP
     a += work->init_state[0];
