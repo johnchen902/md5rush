@@ -1,3 +1,4 @@
 __pycache__
 /md5rush-simd/md5rush-simd
 /md5rush-opencl/md5rush-opencl
+/md5rush-boost-compute/md5rush-boost-compute

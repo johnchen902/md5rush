@@ -13,15 +13,6 @@
 #endif
 
 namespace {
-
-bool check_cl_error(cl_int err) {
-    if (err != CL_SUCCESS) {
-        std::cerr << "OpenCL error: " << err << std::endl;
-        return true;
-    }
-    return false;
-}
-
 template<typename T>
 class Scope_exit {
     T t;
@@ -34,88 +25,12 @@ public:
     ~Scope_exit() { t(); }
 };
 
-std::optional<cl_platform_id> select_platform() {
-    cl_uint size;
-    if (check_cl_error(clGetPlatformIDs(0, nullptr, &size)))
-        return std::nullopt;
-    if (size == 0)
-        return std::nullopt;
-
-    std::vector<cl_platform_id> platforms(size);
-    if (check_cl_error(clGetPlatformIDs(size, platforms.data(), nullptr)))
-        return std::nullopt;
-
-    // TODO proper selection
-    return platforms[0];
-}
-
-std::optional<cl_device_id> select_device(cl_platform_id platform) {
-    cl_uint size;
-    if (check_cl_error(clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0,
-                nullptr, &size)))
-        return std::nullopt;
-    if (size == 0)
-        return std::nullopt;
-
-    std::vector<cl_device_id> devices(size);
-    if (check_cl_error(clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, size,
-                devices.data(), nullptr)))
-        return std::nullopt;
-
-    // TODO proper selection
-    return devices[0];
-}
-
-cl_context create_context(cl_platform_id platform, cl_device_id device) {
-    cl_context_properties properties[] = {
-        CL_CONTEXT_PLATFORM, (cl_context_properties) platform,
-        0,
-    };
-    cl_int err;
-    cl_context context = clCreateContext(properties, 1, &device,
-            nullptr, nullptr, &err);
-    check_cl_error(err);
-    return context;
-}
-
-cl_command_queue create_command_queue(
-        cl_context context, cl_device_id device) {
-    cl_int err;
-    cl_command_queue cmdqueue = clCreateCommandQueue(context, device, 0, &err);
-    check_cl_error(err);
-    return cmdqueue;
-}
-
-cl_program create_program(cl_context context, const char *source) {
-    cl_int err;
-    cl_program program = clCreateProgramWithSource(
-            context, 1, &source, nullptr, &err);
-    check_cl_error(err);
-    return program;
-}
-
-cl_kernel create_kernel(cl_program program, const char *kernel_name) {
-    cl_int err;
-    cl_kernel kernel = clCreateKernel(program, kernel_name, &err);
-    check_cl_error(err);
-    return kernel;
-}
-
-struct My_context {
-    cl_context context;
-    cl_kernel kernel_md5rush, kernel_ffz;
-    cl_command_queue cmdqueue;
-    cl_uint max_compute_units;
-    size_t ffz_work_group_size;
-};
-
 struct Work {
-    std::array<uint32_t, 4> init_state;
-    std::array<uint32_t, 4> mask;
-    std::array<uint32_t, 16> data;
+    uint32_t init_state[4];
+    uint32_t mask[4];
+    uint32_t data[16];
     uint32_t mutable_index;
     uint64_t count;
-    Work() = default;
 };
 
 std::istream &operator >> (std::istream &in, Work &work) {
@@ -125,7 +40,10 @@ std::istream &operator >> (std::istream &in, Work &work) {
         in >> u;
     for (uint32_t &u : work.data)
         in >> u;
-    return in >> work.mutable_index >> work.count;
+    in >> work.mutable_index >> work.count;
+    if (work.mutable_index >= std::size(work.data))
+        in.setstate(std::ios_base::failbit);
+    return in;
 }
 
 constexpr const char *md5rush_source = R"(
@@ -137,7 +55,9 @@ struct Work {
     ulong count; // unused
 };
 
-__kernel void md5rush(__constant struct Work *work, __global uint *result) {
+__kernel void md5rush(__constant struct Work *work,
+        volatile __global uint *found,
+        volatile __global uint *index) {
     uint a = work->init_state[0];
     uint b = work->init_state[1];
     uint c = work->init_state[2];
@@ -224,216 +144,212 @@ __kernel void md5rush(__constant struct Work *work, __global uint *result) {
     b &= work->mask[1];
     c &= work->mask[2];
     d &= work->mask[3];
-    result[get_global_id(0)] = a | b | c | d;
-}
-__kernel void find_first_zero(__global uint *a, ulong size,
-        __local ulong *buffer, __global ulong *result) {
-    ulong ans = size;
-    for (ulong i = get_global_id(0); i < size; i += get_global_size(0))
-        ans = min(ans, a[i] ? size : i);
-
-    uint local_id = get_local_id(0);
-    buffer[local_id] = ans;
-    for (uint stride = get_local_size(0) >> 1; stride; stride >>= 1) {
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (local_id < stride)
-            buffer[local_id] = min(buffer[local_id], buffer[local_id + stride]);
+    if ((a | b | c | d) == 0) {
+        atom_inc(found);
+        atom_min(index, get_global_id(0));
     }
-    if (local_id == 0)
-        result[get_group_id(0)] = buffer[0];
 }
 )";
-
-std::optional<uint32_t> md5rush(const Work &work, const My_context &context) {
-    // Good luck pwning me.
-    if (work.mutable_index >= work.data.size())
-        return std::nullopt;
-    // Trying duplicate messages is a waste.
-    uint64_t count = std::min(work.count, 0x100000000u);
-    size_t ffz_work_group_size = context.ffz_work_group_size;
-    size_t ffz_work_items = context.max_compute_units * ffz_work_group_size;
-
-    cl_int err;
-    cl_mem mem_work = clCreateBuffer(context.context,
-            CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR | CL_MEM_HOST_WRITE_ONLY,
-            sizeof(Work), (void*) &work, &err);
-    if (check_cl_error(err))
-        return std::nullopt;
-    Scope_exit release_mem_work([mem_work] () {
-        check_cl_error(clReleaseMemObject(mem_work));
-    });
-
-    cl_mem mem_temp = clCreateBuffer(context.context,
-            CL_MEM_READ_WRITE | CL_MEM_HOST_NO_ACCESS,
-            count * 4, nullptr, &err);
-    if (check_cl_error(err))
-        return std::nullopt;
-    Scope_exit release_mem_temp([mem_temp] () {
-        check_cl_error(clReleaseMemObject(mem_temp));
-    });
-
-    cl_mem mem_result = clCreateBuffer(context.context,
-            CL_MEM_WRITE_ONLY | CL_MEM_HOST_READ_ONLY,
-            8 * context.max_compute_units, nullptr, &err);
-    if (check_cl_error(err))
-        return std::nullopt;
-    Scope_exit release_mem_result([mem_result] () {
-        check_cl_error(clReleaseMemObject(mem_result));
-    });
-
-    if (check_cl_error(clSetKernelArg(
-            context.kernel_md5rush, 0, sizeof(cl_mem), &mem_work)))
-        return std::nullopt;
-    if (check_cl_error(clSetKernelArg(
-            context.kernel_md5rush, 1, sizeof(cl_mem), &mem_temp)))
-        return std::nullopt;
-    if (check_cl_error(clEnqueueNDRangeKernel(
-            context.cmdqueue, context.kernel_md5rush, 1,
-            nullptr, &count, nullptr, 0, nullptr, nullptr)))
-        return std::nullopt;
-
-    if (check_cl_error(clSetKernelArg(
-            context.kernel_ffz, 0, sizeof(cl_mem), &mem_temp)))
-        return std::nullopt;
-    if (check_cl_error(clSetKernelArg(
-            context.kernel_ffz, 1, 8, &count)))
-        return std::nullopt;
-    if (check_cl_error(clSetKernelArg(
-            context.kernel_ffz, 2, 8 * ffz_work_group_size, nullptr)))
-        return std::nullopt;
-    if (check_cl_error(clSetKernelArg(
-            context.kernel_ffz, 3, sizeof(cl_mem), &mem_result)))
-        return std::nullopt;
-    if (check_cl_error(clEnqueueNDRangeKernel(
-            context.cmdqueue, context.kernel_ffz, 1,
-            nullptr, &ffz_work_items, &ffz_work_group_size, 0,
-            nullptr, nullptr)))
-        return std::nullopt;
-
-    std::vector<uint64_t> vec_result(context.max_compute_units, count);
-    if (check_cl_error(clEnqueueReadBuffer(
-            context.cmdqueue, mem_result, CL_TRUE,
-            0, 8 * vec_result.size(), vec_result.data(),
-            0, nullptr, nullptr)))
-        return std::nullopt;
-
-    uint64_t result = *std::min_element(vec_result.begin(), vec_result.end());
-    if (result >= count)
-        return std::nullopt;
-
-    return work.data[work.mutable_index] + result;
-}
-
 }
 
 int main() {
-    std::optional<cl_platform_id> platform = select_platform();
-    if (!platform) {
-        std::cerr << "No platform found." << std::endl;
+    cl_int err;
+
+    cl_device_id device;
+    cl_uint num_devices;
+    err = clGetDeviceIDs(nullptr, CL_DEVICE_TYPE_DEFAULT,
+            1, &device, &num_devices);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Error getting default device: " << err << std::endl;
+        return 1;
+    }
+    if (num_devices == 0) {
+        std::cerr << "No default device found." << std::endl;
         return 1;
     }
 
-    std::optional<cl_device_id> device = select_device(*platform);
-    if (!device) {
-        std::cerr << "No device found." << std::endl;
+    cl_context context = clCreateContext(nullptr, 1, &device,
+            nullptr, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Error creating context: " << err << std::endl;
         return 1;
     }
-
-    cl_context context = create_context(*platform, *device);
-    if (!context) {
-        std::cerr << "Failed to create context." << std::endl;
-        return 1;
-    }
-    Scope_exit release_context([context] () {
-        check_cl_error(clReleaseContext(context));
+    Scope_exit release_context([context] {
+        cl_int err2 = clReleaseContext(context);
+        if (err2 != CL_SUCCESS)
+            std::cerr << "Error releasing context: " << err2 << std::endl;
     });
 
-    cl_program program = create_program(context, md5rush_source);
-    if (!program) {
-        std::cerr << "Failed to create program." << std::endl;
+    const char *sources[] = { md5rush_source };
+    cl_program program = clCreateProgramWithSource(
+            context, 1, sources, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Error creating program: " << err << std::endl;
         return 1;
     }
-    Scope_exit release_program([program] () {
-        check_cl_error(clReleaseProgram(program));
+    Scope_exit release_program([program] {
+        cl_int err2 = clReleaseProgram(program);
+        if (err2 != CL_SUCCESS)
+            std::cerr << "Error releasing program: " << err2 << std::endl;
     });
 
-    if (check_cl_error(clBuildProgram(
-                    program, 1, &*device, "", nullptr, nullptr))) {
-        std::cerr << "Failed to build program." << std::endl;
-        // Determine the size of the log
+    err = clBuildProgram(program, 0, nullptr, "", nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Error building program: " << err << std::endl;
+
         size_t log_size;
-        if (check_cl_error(clGetProgramBuildInfo(program, *device,
-                    CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size))) {
-            std::cerr << "Failed to get build log." << std::endl;
+        err = clGetProgramBuildInfo(program, device,
+                CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error getting build log size: " << err << std::endl;
             return 1;
         }
+
         std::vector<char> log(log_size + 1); 
-        if (check_cl_error(clGetProgramBuildInfo(program, *device,
-                    CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr))) {
-            std::cerr << "Failed to get build log." << std::endl;
+        err = clGetProgramBuildInfo(program, device,
+                CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error getting build log: " << err << std::endl;
             return 1;
         }
+
         std::cerr << log.data() << std::endl;
         return 1;
     }
 
-    cl_kernel kernel_md5rush = create_kernel(program, "md5rush");
-    if (!kernel_md5rush) {
-        std::cerr << "Failed to create kernel \"md5rush\"." << std::endl;
+    cl_kernel kernel_md5rush = clCreateKernel(program, "md5rush", &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Error creating kernel: " << err << std::endl;
         return 1;
     }
-    Scope_exit release_kernel_md5rush([kernel_md5rush] () {
-        check_cl_error(clReleaseKernel(kernel_md5rush));
+    Scope_exit release_kernel_md5rush([kernel_md5rush] {
+        cl_int err2 = clReleaseKernel(kernel_md5rush);
+        if (err2 != CL_SUCCESS)
+            std::cerr << "Error releasing kernel: " << err2 << std::endl;
     });
 
-    cl_kernel kernel_ffz = create_kernel(program, "find_first_zero");
-    if (!kernel_ffz) {
-        std::cerr << "Failed to create kernel \"find_first_zero\"."
-            << std::endl;
+    cl_command_queue cmdqueue = clCreateCommandQueue(context, device, 0, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Error creating command queue: " << err << std::endl;
         return 1;
     }
-    Scope_exit release_kernel_ffz([kernel_ffz] () {
-        check_cl_error(clReleaseKernel(kernel_ffz));
+    Scope_exit release_cmdqueue([cmdqueue] {
+        cl_int err2 = clReleaseCommandQueue(cmdqueue);
+        if (err2 != CL_SUCCESS)
+            std::cerr << "Error releasing command queue: " << err2 << std::endl;
     });
 
-    cl_uint max_compute_units = 0;
-    if (check_cl_error(clGetDeviceInfo(*device,
-            CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(max_compute_units),
-            &max_compute_units, nullptr))) {
-        std::cerr << "Failed to get CL_DEVICE_MAX_COMPUTE_UNITS" << std::endl;
+    cl_mem mem_work = clCreateBuffer(context,
+            CL_MEM_READ_ONLY | CL_MEM_HOST_WRITE_ONLY,
+            sizeof(Work), nullptr, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Error creating buffer 1: " << err << std::endl;
         return 1;
     }
-
-    size_t ffz_work_group_size = 0;
-    if (check_cl_error(clGetKernelWorkGroupInfo(kernel_ffz, *device,
-            CL_KERNEL_WORK_GROUP_SIZE, sizeof(ffz_work_group_size),
-            &ffz_work_group_size, nullptr))) {
-        std::cerr << "Failed to get CL_KERNEL_WORK_GROUP_SIZE"
-            " of \"find_first_zero\"." << std::endl;
-        return 1;
-    }
-
-    cl_command_queue cmdqueue = create_command_queue(context, *device);
-    if (!cmdqueue) {
-        std::cerr << "Failed to create command queue." << std::endl;
-        return 1;
-    }
-    Scope_exit release_cmdqueue([cmdqueue] () {
-        check_cl_error(clReleaseCommandQueue(cmdqueue));
+    Scope_exit release_mem_work([mem_work] {
+        cl_int err2 = clReleaseMemObject(mem_work);
+        if (err2 != CL_SUCCESS)
+            std::cerr << "Error releasing buffer 0: " << err2 << std::endl;
     });
 
-    struct Work work;
-    struct My_context my_context = {
-        context,
-        kernel_md5rush, kernel_ffz,
-        cmdqueue,
-        max_compute_units,
-        ffz_work_group_size,
-    };
+    cl_mem mem_found = clCreateBuffer(context, CL_MEM_READ_WRITE,
+            sizeof(uint32_t), nullptr, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Error creating buffer 2: " << err << std::endl;
+        return 1;
+    }
+    Scope_exit release_mem_found([mem_found] {
+        cl_int err2 = clReleaseMemObject(mem_found);
+        if (err2 != CL_SUCCESS)
+            std::cerr << "Error releasing buffer 1: " << err2 << std::endl;
+    });
+
+    cl_mem mem_index = clCreateBuffer(context, CL_MEM_READ_WRITE,
+            sizeof(uint32_t), nullptr, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Error creating buffer 3: " << err << std::endl;
+        return 1;
+    }
+    Scope_exit release_mem_index([mem_index] {
+        cl_int err2 = clReleaseMemObject(mem_index);
+        if (err2 != CL_SUCCESS)
+            std::cerr << "Error releasing buffer 2: " << err2 << std::endl;
+    });
+
+    Work work;
     while (std::cin >> work) {
-        std::optional<uint32_t> result = md5rush(work, my_context);
-        if (result) {
-            std::cout << "1 " << *result << std::endl;
+        uint32_t found = 0, index = std::numeric_limits<uint32_t>::max();
+
+        err = clEnqueueWriteBuffer(cmdqueue, mem_work,
+                CL_TRUE, 0, sizeof(Work), &work,
+                0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error writing to buffer 0: " << err << std::endl;
+            return 1;
+        }
+
+        err = clEnqueueWriteBuffer(cmdqueue, mem_found,
+                CL_TRUE, 0, sizeof(uint32_t), &found,
+                0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error writing to buffer 1: " << err << std::endl;
+            return 1;
+        }
+
+        err = clEnqueueWriteBuffer(cmdqueue, mem_index,
+                CL_TRUE, 0, sizeof(uint32_t), &index,
+                0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error writing to buffer 2: " << err << std::endl;
+            return 1;
+        }
+
+        err = clSetKernelArg(kernel_md5rush, 0, sizeof(cl_mem), &mem_work);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error setting argument 0: " << err << std::endl;
+            return 1;
+        }
+
+        err = clSetKernelArg(kernel_md5rush, 1, sizeof(cl_mem), &mem_found);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error setting argument 1: " << err << std::endl;
+            return 1;
+        }
+        
+        err = clSetKernelArg(kernel_md5rush, 2, sizeof(cl_mem), &mem_index);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error setting argument 2: " << err << std::endl;
+            return 1;
+        }
+
+        uint64_t count = std::min(work.count, 0x100000000u);
+        err = clEnqueueNDRangeKernel(cmdqueue, kernel_md5rush, 1,
+                nullptr, &count, nullptr,
+                0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error executing kernel: " << err << std::endl;
+            return 1;
+        }
+
+        err = clEnqueueReadBuffer(cmdqueue, mem_found,
+                CL_TRUE, 0, sizeof(uint32_t), &found,
+                0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error reading buffer 1: " << err << std::endl;
+            return 1;
+        }
+
+        err = clEnqueueReadBuffer(cmdqueue, mem_index,
+                CL_TRUE, 0, sizeof(uint32_t), &index,
+                0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Error reading buffer 2: " << err << std::endl;
+            return 1;
+        }
+
+        if (found) {
+            uint32_t result = work.data[work.mutable_index] + index;
+            std::cout << "1 " << result << std::endl;
         } else {
             std::cout << "0 0" << std::endl;
         }
